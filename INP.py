@@ -90,6 +90,30 @@ def get_callees(func_ea):
                         callees.append(callee_func.start_ea)
     return sorted(list(set(callees)))
 
+def collect_callees_recursive(root_ea):
+    """递归收集指定函数及其所有子调用函数（BFS，自动处理循环调用）
+
+    Args:
+        root_ea: 根函数起始地址
+
+    Returns:
+        包含根函数及所有可达子函数地址的 set
+    """
+    visited = set()
+    queue = [root_ea]
+    while queue:
+        func_ea = queue.pop(0)
+        if func_ea in visited:
+            continue
+        func = ida_funcs.get_func(func_ea)
+        if func is None:
+            continue
+        visited.add(func_ea)
+        for callee_ea in get_callees(func_ea):
+            if callee_ea not in visited:
+                queue.append(callee_ea)
+    return visited
+
 def format_address_list(addr_list):
     """格式化地址列表为逗号分隔的十六进制字符串"""
     return ", ".join([hex(addr) for addr in addr_list])
@@ -467,6 +491,204 @@ def export_decompiled_functions(export_dir, skip_existing=True):
 
         print("    Function index saved to: function_index.txt")
 
+def export_decompiled_functions_subtree(export_dir, root_ea, skip_existing=True):
+    """导出指定函数及其所有子调用函数的反编译代码
+
+    以 root_ea 为根，递归收集所有可达的子函数，然后仅导出这些函数。
+    逻辑与 export_decompiled_functions() 一致，只是函数集合被限定为子树。
+
+    Args:
+        export_dir: 导出目录
+        root_ea: 根函数起始地址
+        skip_existing: 是否跳过已存在的文件
+    """
+    decompile_dir = os.path.join(export_dir, "decompile")
+    ensure_dir(decompile_dir)
+
+    # 递归收集函数集合
+    print("[*] Collecting callee subtree from {}...".format(hex(root_ea)))
+    subtree_addrs = collect_callees_recursive(root_ea)
+    print("[*] Found {} functions in subtree (including root)".format(len(subtree_addrs)))
+
+    exported_funcs = 0
+    failed_funcs = []
+    skipped_funcs = []
+    function_index = []
+    addr_to_info = {}
+
+    io_executor = ThreadPoolExecutor(max_workers=1)
+
+    BATCH_SIZE = 10
+    MEMORY_CLEAN_INTERVAL = 5
+    pending_writes = []
+
+    def write_function_file(args):
+        """线程安全的文件写入"""
+        func_ea, func_name, dec_str, callers, callees = args
+
+        output_lines = []
+        output_lines.append("/*")
+        output_lines.append(" * func-name: {}".format(func_name))
+        output_lines.append(" * func-address: {}".format(hex(func_ea)))
+        output_lines.append(" * callers: {}".format(format_address_list(callers) if callers else "none"))
+        output_lines.append(" * callees: {}".format(format_address_list(callees) if callees else "none"))
+        output_lines.append(" */")
+        output_lines.append("")
+        output_lines.append(dec_str)
+
+        output_filename = "{:X}.c".format(func_ea)
+        output_path = os.path.join(decompile_dir, output_filename)
+
+        try:
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(output_lines))
+            return func_ea, func_name, True, output_filename, callers, callees, None
+        except IOError as e:
+            return func_ea, func_name, False, output_filename, callers, callees, str(e)
+
+    remaining_funcs = sorted(subtree_addrs)
+    total_funcs = len(remaining_funcs)
+
+    for idx, func_ea in enumerate(remaining_funcs):
+        func_name = idc.get_func_name(func_ea)
+
+        func = ida_funcs.get_func(func_ea)
+        if func is None:
+            skipped_funcs.append((func_ea, func_name, "not a valid function"))
+            continue
+
+        if func.flags & ida_funcs.FUNC_LIB:
+            skipped_funcs.append((func_ea, func_name, "library function"))
+            continue
+
+        dec_str = None
+        dec_obj = None
+
+        try:
+            dec_obj = ida_hexrays.decompile(func_ea)
+            if dec_obj is None:
+                failed_funcs.append((func_ea, func_name, "decompile returned None"))
+                continue
+
+            dec_str = str(dec_obj)
+            dec_obj = None
+
+            if not dec_str or len(dec_str.strip()) == 0:
+                failed_funcs.append((func_ea, func_name, "empty decompilation result"))
+                continue
+
+            callers = get_callers(func_ea)
+            callees = get_callees(func_ea)
+
+            output_filename = "{:X}.c".format(func_ea)
+            output_path = os.path.join(decompile_dir, output_filename)
+
+            if skip_existing and os.path.exists(output_path):
+                exported_funcs += 1
+                dec_str = None
+                if exported_funcs % 100 == 0:
+                    print("[+] Exported {} / {} functions...".format(exported_funcs, total_funcs))
+                continue
+
+            write_args = (func_ea, func_name, dec_str, callers, callees)
+            future = io_executor.submit(write_function_file, write_args)
+            pending_writes.append((future, func_ea, func_name, output_filename, callers, callees))
+
+            dec_str = None
+
+        except ida_hexrays.DecompilationFailure as e:
+            failed_funcs.append((func_ea, func_name, "decompilation failure: {}".format(str(e))))
+            continue
+        except Exception as e:
+            failed_funcs.append((func_ea, func_name, "unexpected error: {}".format(str(e))))
+            print("[!] Error decompiling {} at {}: {}".format(func_name, hex(func_ea), str(e)))
+            continue
+        finally:
+            dec_obj = None
+            dec_str = None
+
+        if (idx + 1) % MEMORY_CLEAN_INTERVAL == 0:
+            clear_undo_buffer()
+            gc.collect()
+
+        if len(pending_writes) >= BATCH_SIZE:
+            for future, func_ea, func_name, output_filename, callers, callees in pending_writes:
+                try:
+                    result = future.result()
+                    func_ea, func_name, success, output_filename, callers, callees, error = result
+                    if success:
+                        func_info = {
+                            'address': func_ea,
+                            'name': func_name,
+                            'filename': output_filename,
+                            'callers': callers,
+                            'callees': callees
+                        }
+                        function_index.append(func_info)
+                        addr_to_info[func_ea] = func_info
+                        exported_funcs += 1
+                    else:
+                        failed_funcs.append((func_ea, func_name, "IO error: {}".format(error)))
+                except Exception as e:
+                    print("[!] Write error: {}".format(str(e)))
+
+            if exported_funcs % 100 == 0:
+                print("[+] Exported {} / {} functions...".format(exported_funcs, total_funcs))
+
+            pending_writes = []
+            gc.collect()
+
+    # 处理剩余的写入任务
+    if pending_writes:
+        for future, func_ea, func_name, output_filename, callers, callees in pending_writes:
+            try:
+                result = future.result()
+                func_ea, func_name, success, output_filename, callers, callees, error = result
+                if success:
+                    func_info = {
+                        'address': func_ea,
+                        'name': func_name,
+                        'filename': output_filename,
+                        'callers': callers,
+                        'callees': callees
+                    }
+                    function_index.append(func_info)
+                    addr_to_info[func_ea] = func_info
+                    exported_funcs += 1
+                else:
+                    failed_funcs.append((func_ea, func_name, "IO error: {}".format(error)))
+            except Exception as e:
+                print("[!] Write error: {}".format(str(e)))
+
+    io_executor.shutdown(wait=True)
+
+    print("\n[*] Subtree Decompilation Summary:")
+    print("    Root function: {} ({})".format(idc.get_func_name(root_ea), hex(root_ea)))
+    print("    Total functions in subtree: {}".format(total_funcs))
+    print("    Exported: {}".format(exported_funcs))
+    print("    Skipped: {} (library/invalid functions)".format(len(skipped_funcs)))
+    print("    Failed: {}".format(len(failed_funcs)))
+
+    if failed_funcs:
+        failed_log_path = os.path.join(export_dir, "decompile_failed.txt")
+        with open(failed_log_path, 'w', encoding='utf-8') as f:
+            f.write("# Failed to decompile {} functions\n".format(len(failed_funcs)))
+            f.write("# Format: address | function_name | reason\n")
+            f.write("#" + "=" * 80 + "\n\n")
+            for addr, name, reason in failed_funcs:
+                f.write("{} | {} | {}\n".format(hex(addr), name, reason))
+        print("    Failed list saved to: decompile_failed.txt")
+
+    if skipped_funcs:
+        skipped_log_path = os.path.join(export_dir, "decompile_skipped.txt")
+        with open(skipped_log_path, 'w', encoding='utf-8') as f:
+            f.write("# Skipped {} functions\n".format(len(skipped_funcs)))
+            f.write("# Format: address | function_name | reason\n")
+            f.write("#" + "=" * 80 + "\n\n")
+            for addr, name, reason in skipped_funcs:
+                f.write("{} | {} | {}\n".format(hex(addr), name, reason))
+        print("    Skipped list saved to: decompile_skipped.txt")
+
 def export_strings(export_dir):
     """导出所有字符串"""
     strings_path = os.path.join(export_dir, "strings.txt")
@@ -766,6 +988,157 @@ def do_export(export_dir=None, ask_user=True, skip_auto_analysis=False, worker_c
 
     ida_kernwin.info("Export completed!\n\nOutput directory:\n{}".format(export_dir))
 
+def do_export_subtree(root_ea=None, export_dir=None, ask_user=True, skip_auto_analysis=False):
+    """导出指定函数及其所有子调用函数
+
+    询问用户选择根函数（默认为当前光标所在函数），然后递归导出该函数
+    及其所有可达的子函数。同时导出字符串、导入表和导出表。
+
+    Args:
+        root_ea: 根函数起始地址；为 None 时使用当前光标位置或询问用户
+        export_dir: 导出目录路径；为 None 时使用默认目录或询问用户
+        ask_user: 是否通过对话框询问用户
+        skip_auto_analysis: 是否跳过等待自动分析
+    """
+    print("=" * 60)
+    print("IDA Export for AI Analysis (Function Subtree Mode)")
+    print("=" * 60)
+
+    clear_undo_buffer()
+    disable_undo()
+
+    if not ida_hexrays.init_hexrays_plugin():
+        print("[!] Hex-Rays decompiler is not available!")
+        enable_undo()
+        return
+
+    print("[+] Hex-Rays decompiler initialized")
+
+    if not skip_auto_analysis:
+        print("[*] Waiting for auto-analysis to complete...")
+        clear_undo_buffer()
+        ida_auto.auto_wait()
+        clear_undo_buffer()
+    else:
+        print("[*] Skipping auto-analysis wait (assuming already complete)")
+
+    # 确定根函数地址
+    if root_ea is None:
+        # 使用当前光标所在函数作为默认值
+        cursor_ea = idc.get_screen_ea()
+        cursor_func = ida_funcs.get_func(cursor_ea)
+        default_ea_str = hex(cursor_func.start_ea) if cursor_func else ""
+
+        if ask_user:
+            ea_str = ida_kernwin.ask_str(
+                default_ea_str, 0,
+                "Enter root function address (hex) or name to export its subtree:"
+            )
+            if not ea_str:
+                print("[*] Export cancelled by user")
+                enable_undo()
+                return
+            ea_str = ea_str.strip()
+            # 支持函数名或十六进制地址
+            resolved = idc.get_name_ea_simple(ea_str)
+            if resolved != idc.BADADDR:
+                root_ea = resolved
+            else:
+                try:
+                    root_ea = int(ea_str, 16)
+                except ValueError:
+                    print("[!] Invalid address or function name: {}".format(ea_str))
+                    enable_undo()
+                    return
+        elif cursor_func:
+            root_ea = cursor_func.start_ea
+        else:
+            print("[!] No function at current cursor position")
+            enable_undo()
+            return
+
+    # 验证根函数
+    root_func = ida_funcs.get_func(root_ea)
+    if root_func is None:
+        print("[!] No function found at address {}".format(hex(root_ea)))
+        enable_undo()
+        return
+
+    root_name = idc.get_func_name(root_ea)
+    print("[+] Root function: {} ({})".format(root_name, hex(root_ea)))
+
+    # 确定导出目录
+    if export_dir is None:
+        idb_dir = get_idb_directory()
+        default_export_dir = os.path.join(
+            idb_dir, "export-for-ai",
+            "subtree_{}".format(sanitize_filename(root_name) or "{:X}".format(root_ea))
+        )
+
+        if ask_user:
+            choice = ida_kernwin.ask_yn(
+                ida_kernwin.ASKBTN_YES,
+                "Export to default directory?\n\n{}\n\n"
+                "Yes: Use default directory\n"
+                "No: Choose custom directory\n"
+                "Cancel: Abort export".format(default_export_dir)
+            )
+            if choice == ida_kernwin.ASKBTN_CANCEL:
+                print("[*] Export cancelled by user")
+                enable_undo()
+                return
+            elif choice == ida_kernwin.ASKBTN_NO:
+                selected_dir = ida_kernwin.ask_str(default_export_dir, 0, "Enter export directory path:")
+                if selected_dir:
+                    export_dir = selected_dir
+                    print("[*] Using custom directory: {}".format(export_dir))
+                else:
+                    print("[*] Export cancelled by user")
+                    enable_undo()
+                    return
+            else:
+                export_dir = default_export_dir
+        else:
+            export_dir = default_export_dir
+
+    ensure_dir(export_dir)
+    print("[+] Export directory: {}".format(export_dir))
+    print("")
+
+    print("[*] Exporting strings...")
+    export_strings(export_dir)
+    clear_undo_buffer()
+    print("")
+
+    print("[*] Exporting imports...")
+    export_imports(export_dir)
+    clear_undo_buffer()
+    print("")
+
+    print("[*] Exporting exports...")
+    export_exports(export_dir)
+    clear_undo_buffer()
+    print("")
+
+    print("[*] Exporting decompiled function subtree...")
+    export_decompiled_functions_subtree(export_dir, root_ea, skip_existing=True)
+
+    enable_undo()
+
+    print("")
+    print("=" * 60)
+    print("[+] Export completed!")
+    print("    Root function: {} ({})".format(root_name, hex(root_ea)))
+    print("    Output directory: {}".format(export_dir))
+    print("=" * 60)
+
+    ida_kernwin.info(
+        "Export completed!\n\nRoot function: {} ({})\nOutput directory:\n{}".format(
+            root_name, hex(root_ea), export_dir
+        )
+    )
+
+
 
 # ============================================================================
 # Plugin Class
@@ -783,12 +1156,55 @@ class ExportForAIPlugin(ida_idaapi.plugin_t):
     def init(self):
         """插件初始化"""
         print("[+] Export for AI plugin loaded")
-        print("    Hotkey: {}".format(self.wanted_hotkey))
+        print("    Hotkey: {} (Export All)".format(self.wanted_hotkey))
+        print("    Hotkey: Ctrl-Shift-F (Export Function Subtree)")
         print("    Menu: Edit -> Plugins -> Export for AI")
+
+        # 注册子树导出快捷键
+        class SubtreeExportAction(ida_kernwin.action_handler_t):
+            def activate(self, ctx):
+                try:
+                    choice = ida_kernwin.ask_yn(
+                        ida_kernwin.ASKBTN_YES,
+                        "Has the auto-analysis already completed?\n\n"
+                        "Yes: Skip waiting for auto-analysis (faster)\n"
+                        "No: Wait for auto-analysis to complete\n"
+                        "Cancel: Abort export"
+                    )
+                    if choice == ida_kernwin.ASKBTN_CANCEL:
+                        print("[*] Export cancelled by user")
+                        return 0
+                    skip_analysis = (choice == ida_kernwin.ASKBTN_YES)
+                    do_export_subtree(skip_auto_analysis=skip_analysis)
+                except Exception as e:
+                    print("[!] Export failed: {}".format(str(e)))
+                    import traceback
+                    traceback.print_exc()
+                    ida_kernwin.warning("Export failed!\n\n{}".format(str(e)))
+                return 1
+
+            def update(self, ctx):
+                return ida_kernwin.AST_ENABLE_ALWAYS
+
+        action_desc = ida_kernwin.action_desc_t(
+            "inp:export_subtree",
+            "Export Function Subtree for AI",
+            SubtreeExportAction(),
+            "Ctrl-Shift-F",
+            "Export current function and all its callees for AI analysis",
+            -1
+        )
+        ida_kernwin.register_action(action_desc)
+        ida_kernwin.attach_action_to_menu(
+            "Edit/Plugins/",
+            "inp:export_subtree",
+            ida_kernwin.SETMENU_APP
+        )
+
         return ida_idaapi.PLUGIN_KEEP
 
     def run(self, arg):
-        """插件运行"""
+        """插件运行（Ctrl-Shift-E：导出所有函数）"""
         try:
             # 询问是否跳过自动分析（如果用户已经分析完成）
             choice = ida_kernwin.ask_yn(ida_kernwin.ASKBTN_YES,
@@ -808,6 +1224,7 @@ class ExportForAIPlugin(ida_idaapi.plugin_t):
             import traceback
             traceback.print_exc()
             ida_kernwin.warning("Export failed!\n\n{}".format(str(e)))
+
 
     def term(self):
         """插件卸载"""

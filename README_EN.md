@@ -25,8 +25,9 @@ Copy `INP.py` to the IDA plugins directory:
 
 After restarting IDA:
 
-- **Hotkey**: `Ctrl-Shift-E` for quick export
-- **Menu**: `Edit` -> `Plugins` -> `Export for AI`
+- **Hotkey**: `Ctrl-Shift-E` to export all functions
+- **Hotkey**: `Ctrl-Shift-F` to export a specific function and its callees only
+- **Menu**: `Edit` -> `Plugins` -> `Export for AI` / `Export Function Subtree for AI`
 
 ## Exported Content
 
@@ -64,6 +65,16 @@ Each function is exported as a separate `.c` file with metadata header:
 - Handles special characters and duplicate function names (adds address suffix)
 - Generates detailed failure and skip logs
 - Shows export progress (every 100 functions)
+
+### Function Subtree Export (`Ctrl-Shift-F`)
+
+Export only a **specific function and all the sub-functions it recursively calls**, ideal when you care about a particular module or feature:
+
+1. Press `Ctrl-Shift-F` (or `Edit -> Plugins -> Export Function Subtree for AI`)
+2. Enter the target function address (hex) or name in the prompt — defaults to the function at the current cursor
+3. The plugin recursively collects all directly and indirectly called sub-functions and exports only those
+
+The default output directory is `<IDB dir>/export-for-ai/subtree_<function_name>/`. Strings, imports, and exports are also included.
 
 ### Call Relationship Analysis
 
